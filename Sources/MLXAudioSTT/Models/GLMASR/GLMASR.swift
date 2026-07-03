@@ -24,6 +24,12 @@ enum AudioConstants {
 // MARK: - Prompt Templates
 
 private enum PromptTemplate {
+    /// GLM-4 chat-template system turn carrying optional text context
+    /// (preceding transcript, domain vocabulary). The ASR fine-tune was
+    /// trained on the bare user turn below, so context conditioning is
+    /// best-effort: the base model reads the system turn, but callers should
+    /// validate output quality with context enabled before relying on it.
+    static let systemPrefix = "<|system|>\n"
     static let userPrefix = "<|user|>\n<|begin_of_audio|>"
     static let userSuffix = "<|end_of_audio|>\nPlease transcribe this audio into text<|assistant|>\n"
 }
@@ -40,7 +46,8 @@ extension GLMASRModel: STTGenerationModel {
             temperature: generationParameters.temperature,
             topP: generationParameters.topP,
             topK: generationParameters.topK,
-            verbose: generationParameters.verbose
+            verbose: generationParameters.verbose,
+            context: generationParameters.context
         )
     }
 
@@ -52,7 +59,8 @@ extension GLMASRModel: STTGenerationModel {
             audio: audio,
             maxTokens: generationParameters.maxTokens,
             temperature: generationParameters.temperature,
-            topP: generationParameters.topP
+            topP: generationParameters.topP,
+            context: generationParameters.context
         )
     }
 }
@@ -396,7 +404,8 @@ public class GLMASRModel: Module {
         temperature: Float = 0.0,
         topP: Float = 0.95,
         topK: Int = 0,
-        verbose: Bool = false
+        verbose: Bool = false,
+        context: String? = nil
     ) -> STTOutput {
         guard let tokenizer = tokenizer else {
             fatalError("Tokenizer not loaded")
@@ -405,8 +414,10 @@ public class GLMASRModel: Module {
         let startTime = Date()
 
         // Prepare for generation
-        let (context, promptTokenCount) = prepareGeneration(audio: audio, tokenizer: tokenizer)
-        var ctx = context
+        let (generationContext, promptTokenCount) = prepareGeneration(
+            audio: audio, tokenizer: tokenizer, textContext: context
+        )
+        var ctx = generationContext
 
         // Generate tokens
         var generatedTokens: [Int] = []
@@ -456,19 +467,22 @@ public class GLMASRModel: Module {
         audio: MLXArray,
         maxTokens: Int = 128,
         temperature: Float = 0.0,
-        topP: Float = 0.95
+        topP: Float = 0.95,
+        context: String? = nil
     ) -> AsyncThrowingStream<STTGeneration, Error> {
         AsyncThrowingStream { continuation in
             do {
                 guard let tokenizer = self.tokenizer else {
                     throw STTError.modelNotInitialized("Tokenizer not loaded")
                 }
-                
+
                 let startTime = Date()
-                
+
                 // Prepare for generation
-                let (context, promptTokenCount) = self.prepareGeneration(audio: audio, tokenizer: tokenizer)
-                var ctx = context
+                let (generationContext, promptTokenCount) = self.prepareGeneration(
+                    audio: audio, tokenizer: tokenizer, textContext: context
+                )
+                var ctx = generationContext
                 
                 let prefillEndTime = Date()
                 let prefillTime = prefillEndTime.timeIntervalSince(startTime)
@@ -709,7 +723,11 @@ public class GLMASRModel: Module {
     }
 
     /// Prepare generation context with audio encoding and prompt setup.
-    private func prepareGeneration(audio: MLXArray, tokenizer: Tokenizer) -> (GenerationContext, Int) {
+    /// `textContext`, when non-empty, is rendered as a `<|system|>` turn
+    /// ahead of the audio user turn.
+    private func prepareGeneration(
+        audio: MLXArray, tokenizer: Tokenizer, textContext: String? = nil
+    ) -> (GenerationContext, Int) {
         // Preprocess audio to mel spectrogram
         let mel = preprocessAudio(audio)
 
@@ -718,14 +736,21 @@ public class GLMASRModel: Module {
         eval(audioEmbeds)
 
         // Build prompt tokens
-        var tokens = tokenizer.encode(text: PromptTemplate.userPrefix)
+        var promptPrefix = PromptTemplate.userPrefix
+        if let textContext, !textContext.isEmpty {
+            promptPrefix = PromptTemplate.systemPrefix + textContext + promptPrefix
+        }
+        var tokens = tokenizer.encode(text: promptPrefix)
+        // Audio placeholders start exactly where the encoded prefix ends —
+        // captured here rather than re-encoding the prefix, so the offset
+        // stays correct whatever the prefix contains.
+        let audioStart = tokens.count
         tokens.append(contentsOf: Array(repeating: 0, count: audioLen))
         tokens.append(contentsOf: tokenizer.encode(text: PromptTemplate.userSuffix))
 
         let inputIds = MLXArray(tokens.map { Int32($0) }).expandedDimensions(axis: 0)
         let promptTokenCount = inputIds.shape[1]
 
-        let audioStart = tokenizer.encode(text: PromptTemplate.userPrefix).count
         let audioOffsets = [[audioStart]]
         let audioLength = [[audioLen]]
 
